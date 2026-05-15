@@ -8,12 +8,17 @@ def langevin_sample_train(
     noise_std=0.005,
     grad_clip=0.01,
     clamp=True,
+    conditioning=None
 ):
     model.eval()
     x = x_init.detach().clone().requires_grad_(True)
     for i in range(n_steps):
         # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        energy = model(x).sum()
+        if conditioning is None:
+            energy = model.energy(x).sum()
+        else:
+            logits = model.classify(x)[:, conditioning]
+            energy = -logits.sum()
         grad = torch.autograd.grad(energy, x)[0]
         if grad_clip is not None:
             grad = grad.clamp(-grad_clip, grad_clip)  # prevent blowups

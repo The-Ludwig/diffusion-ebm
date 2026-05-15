@@ -233,8 +233,12 @@ class EBM(nn.Module):
     def forward(self, x):
         return self.net(x).squeeze(-1)
 
+    def classify(self, x):
+        assert self.n_out > 1, "Model does not output class logits"
+        return self.forward(x)
+
     def energy(self, x):
         if self.n_out > 1:
-            return torch.logsumexp(self.forward(x), dim=0)
+            return torch.logsumexp(self.forward(x), dim=-1)
         else:
             return self.forward(x)

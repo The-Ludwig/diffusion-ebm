@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.23.5"
+__generated_with = "0.23.6"
 app = marimo.App(width="medium")
 
 with app.setup:
@@ -73,7 +73,6 @@ with app.setup:
         from tqdm import tqdm
 
 
-
 @app.cell
 def _():
     if torch.cuda.is_available():
@@ -111,14 +110,14 @@ def _():
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_epochs", type=int, default=200)
     parser.add_argument("--val_every", type=int, default=200)
-    parser.add_argument("--save_every", type=int, default=5000)
-    parser.add_argument("--lr_schedule", type=str, default="cosine_old")
+    parser.add_argument("--save_every", type=int, default=1000)
+    parser.add_argument("--lr_schedule", type=str, default="cosine")
 
     if marimo.running_in_notebook():
         args, _ = parser.parse_known_args()
 
-        name = "notebook_run"
-        args.conditioning = False
+        name = "notebook_run_JEM_schedule"
+        args.lr_schedule = "JEM"
     else:
         args = parser.parse_args()
 
@@ -226,12 +225,16 @@ def _(
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, betas=(0.0, 0.999))
 
+    steps_per_epoch = len(dataloader)
+
     if lr_schedule == "cosine_old":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5000)
     elif lr_schedule == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs*len(dataloader), eta_min=1e-6)
     elif lr_schedule == "constant":
         scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
+    elif lr_schedule == "JEM":
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[steps_per_epoch*50, steps_per_epoch*100], gamma=0.3, last_epoch=-1)
     else:
         raise ValueError(f"Unknown lr_schedule: {lr_schedule}")
 
@@ -240,18 +243,14 @@ def _(
 
 
 @app.cell
-def _(dataloader, num_epochs):
-    num_epochs*len(dataloader)
-    return
-
-
-@app.cell
-def _(model, replay_size):
+def _(conditioning, device, model, n_classes, replay_size):
     ##########################################
     # Set up replay buffer and training state
     ##########################################
-    replay_buffer = torch.rand(replay_size, model.in_channels, model.img_size, model.img_size, device="cuda") * 2 - 1  # init in [-1, 1]
-    state = {'step': 0, 'loss_reg': [], 'val_energy': {},  'val_rand_energy': {}, 'e_pos': [], 'e_neg': [], 'e_rand': [], 'lr': []}
+    replay_buffer = torch.rand(replay_size, model.in_channels, model.img_size, model.img_size, device=device) * 2 - 1  # init in [-1, 1]
+    if conditioning:
+        replay_conditioning = torch.arange(replay_size, device=device) % n_classes
+    state = {'step': 0, 'loss_reg': [], 'val_energy': {},  'val_rand_energy': {}, 'e_pos': [], 'e_neg': [], 'e_rand': [], 'lr': [], 'celoss': []}
     return replay_buffer, state
 
 
@@ -289,7 +288,7 @@ def _(
             if not load_checkpoint.exists():
                 raise ValueError(f"Checkpoint {load_checkpoint} does not exist.")
             print(f"Loading checkpoint: {load_checkpoint}")
-    
+
         # Load everything
         loaded_state = torch.load(load_checkpoint)
         model.load_state_dict(loaded_state['model_state_dict'])
@@ -301,7 +300,7 @@ def _(
             state[key] = loaded_state['state'][key]
     else: 
         path.mkdir(parents=True, exist_ok=True)
-    
+
     return path, plot_path
 
 
@@ -350,123 +349,137 @@ def show_replay_buffer_samples(replay_buffer, n_samples=15**2, determinisitic=Tr
     return fig, ax
 
 
-@app.cell
-def _(conditioning):
-    def train_ebm(model, dataloader, val_loader, replay_buffer, state, optimizer, scheduler, model_ema, path, alpha=0.1, reinit_prob=0.05, val_every=200, save_every=1000, num_epochs=50, noise_level=0.005):
+@app.function
+def train_ebm(model, dataloader, val_loader, replay_buffer, state, optimizer, scheduler, model_ema, path, alpha=0.1, reinit_prob=0.05, val_every=200, save_every=1000, num_epochs=50, noise_level=0.005, conditioning=False, n_classes=1):
+    if conditioning:
+        ce = nn.CrossEntropyLoss()
 
-        tb = SummaryWriter(log_dir=path/"logs")
+    tb = SummaryWriter(log_dir=path/"logs")
 
-        for epoch in tqdm(range(num_epochs)):
-            try:
-                pbar = tqdm(dataloader, desc=f"Epoch {epoch} (Total: {state['step']//len(dataloader)})", leave=False)
-                for _x, _y in dataloader:
-                    _x = _x.to("cuda")
-                    _x = _x + noise_level * torch.randn_like(_x)
-                    if conditioning:
-                        _y = _y.to("cuda")
+    for epoch in tqdm(range(num_epochs)):
+        try:
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch} (Total: {state['step']//len(dataloader)})", leave=False)
+            for _x, _y in dataloader:
+                _x = _x.to("cuda")
+                _x = _x + noise_level * torch.randn_like(_x)
+                if conditioning:
+                    _y = _y.to("cuda")
 
-                    n_batch = _x.shape[0]
+                n_batch = _x.shape[0]
 
-                    # --- Draw negatives from buffer, occasionally reinit from noise ---
-                    idx = torch.randint(0, replay_buffer.shape[0], (n_batch,), device="cuda")
-                    x_neg = replay_buffer[idx]
-                    reinit_mask = torch.rand(n_batch, device="cuda") < reinit_prob
-                    x_neg[reinit_mask] = torch.rand_like(x_neg[reinit_mask]) * 2 - 1
+                # --- Draw negatives from buffer, occasionally reinit from noise ---
+                idx = torch.randint(0, replay_buffer.shape[0], (n_batch,), device="cuda")
+                x_neg = replay_buffer[idx]
+                reinit_mask = torch.rand(n_batch, device="cuda") < reinit_prob
+                x_neg[reinit_mask] = torch.rand_like(x_neg[reinit_mask]) * 2 - 1
 
-                    # --- Run Langevin to refine negatives ---
-                    # x_neg = langevin_sample(model, x_neg)
+                # --- Run Langevin to refine negatives ---
+                # x_neg = langevin_sample(model, x_neg)
+                if conditioning:
+                    x_neg_out = langevin_sample_train(model, x_neg, n_steps=40, step_size=.5, noise_std=0.01, grad_clip=.1)
+                else: 
                     x_neg_out = langevin_sample_train(model, x_neg)
 
-                    # --- Write refined negatives back to buffer ---
-                    replay_buffer[idx] = x_neg_out
+                # --- Write refined negatives back to buffer ---
+                replay_buffer[idx] = x_neg_out
 
-                    # --- Compute loss ---
-                    energies = model(torch.cat([_x, x_neg_out]))
-                    e_pos, e_neg = energies.split(n_batch)
+                # --- Compute loss ---
+                energies = model.energy(torch.cat([_x, x_neg_out]))
+                e_pos, e_neg = energies.split(n_batch)
 
-                    cd_loss = e_pos.mean() - e_neg.mean()
-                    reg_loss = e_pos.pow(2).mean() + e_neg.pow(2).mean()
-                    loss = cd_loss + alpha*reg_loss
-                    state['loss_reg'].append(reg_loss.item())
-                    state['e_pos'].append(e_pos.mean().item())
-                    state['e_neg'].append(e_neg.mean().item())
-                    x_rand = torch.rand_like(_x) * 2 - 1
-                    state['e_rand'].append(model(x_rand).mean().item())
-                    state['lr'].append(optimizer.param_groups[0]['lr'])
+                cd_loss = e_pos.mean() - e_neg.mean()
+                reg_loss = e_pos.pow(2).mean() + e_neg.pow(2).mean()
+                loss = cd_loss
 
-                    tb.add_scalar("Loss/reg", reg_loss, state['step'])
-                    tb.add_scalar("Loss/cd", cd_loss, state['step'])
-                    tb.add_scalar("Loss", loss, state['step'])
-                    tb.add_scalar("Energy/e_pos-e_rand", state['e_pos'][-1] - state['e_rand'][-1], state['step'])
-                    tb.add_scalar("Energy/e_neg-e_rand", state['e_neg'][-1] - state['e_rand'][-1], state['step'])
-                    tb.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], state['step'])
+                if conditioning:
+                    logits = model.classify(_x)
+                    celoss = ce(logits, _y)
+                    loss = loss + celoss
+                    state['celoss'].append(celoss.item())
+                    tb.add_scalar("Loss/celoss", celoss, state['step'])
+                else:
+                    loss += alpha*reg_loss
 
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    scheduler.step()
+                state['loss_reg'].append(reg_loss.item())
+                state['e_pos'].append(e_pos.mean().item())
+                state['e_neg'].append(e_neg.mean().item())
+                x_rand = torch.rand_like(_x) * 2 - 1
+                state['e_rand'].append(model.energy(x_rand).mean().item())
+                state['lr'].append(optimizer.param_groups[0]['lr'])
 
-                    model_ema.update()
+                tb.add_scalar("Loss/reg", reg_loss, state['step'])
+                tb.add_scalar("Loss/cd", cd_loss, state['step'])
+                tb.add_scalar("Loss", loss, state['step'])
+                tb.add_scalar("Energy/e_pos-e_rand", state['e_pos'][-1] - state['e_rand'][-1], state['step'])
+                tb.add_scalar("Energy/e_neg-e_rand", state['e_neg'][-1] - state['e_rand'][-1], state['step'])
+                tb.add_scalar("Learning Rate", optimizer.param_groups[0]['lr'], state['step'])
 
-                    # --- Periodic validation ---
-                    if state['step'] % val_every == 0:
-                        val_energy, val_rand_energy = eval_ebm(model, val_loader, device="cuda")
-                        state['val_energy'][state['step']] = val_energy
-                        state['val_rand_energy'][state['step']] = val_rand_energy
-                        tb.add_scalar("Val Energy/e_val-e_rand", val_energy - val_rand_energy, state['step'])
-                        _fig, _ = show_replay_buffer_samples(replay_buffer, step=state['step'])
-                        _fig.savefig(path/f"replay_buffer_step_{state['step']}.png")
-                        plt.close(_fig)
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
 
-                    if state['step'] % save_every == 0:
-                        torch.save({
-                            'model_state_dict': model.state_dict(),
-                            'ema_shadow': model_ema.shadow,
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'scheduler_state_dict': scheduler.state_dict(),
-                            'replay_buffer': replay_buffer,
-                            'state': state
-                        }, path/f"step_{state['step']}.pt")
+                model_ema.update()
 
-                    state['step'] = state['step'] + 1
+                # --- Periodic validation ---
+                if state['step'] % val_every == 0:
+                    val_energy, val_rand_energy = eval_ebm(model, val_loader, device="cuda")
+                    state['val_energy'][state['step']] = val_energy
+                    state['val_rand_energy'][state['step']] = val_rand_energy
+                    tb.add_scalar("Val Energy/e_val-e_rand", val_energy - val_rand_energy, state['step'])
+                    _fig, _ = show_replay_buffer_samples(replay_buffer, step=state['step'])
+                    _fig.savefig(path/f"replay_buffer_step_{state['step']}.png")
+                    plt.close(_fig)
 
-                    pbar.set_postfix({
-                        "loss_reg": f"{state['loss_reg'][-1]:.2f}",
-                        "e_pos-e_rand": f"{state['e_pos'][-1] - state['e_rand'][-1]:.2f}",
-                        "e_neg-e_rand": f"{state['e_neg'][-1] - state['e_rand'][-1]:.2f}",
-                        "val_energy": f"{list(state['val_energy'].values())[-1]-list(state['val_rand_energy'].values())[-1]:.2f}" if len(state['val_energy']) > 0 else "N/A"
-                    })
+                if state['step'] % save_every == 0:
+                    torch.save({
+                        'model_state_dict': model.state_dict(),
+                        'ema_shadow': model_ema.shadow,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'replay_buffer': replay_buffer,
+                        'state': state
+                    }, path/f"step_{state['step']}.pt")
 
-                    pbar.update()
+                state['step'] = state['step'] + 1
 
-            except KeyboardInterrupt:
-                print("Training interrupted. Saving checkpoint...")
-                torch.save({
-                    'model_state_dict': model.state_dict(),
-                    'ema_shadow': model_ema.shadow,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'replay_buffer': replay_buffer,
-                    'state': state
-                }, path/f"step_{state['step']}_interrupted.pt")
-                _fig, _ = show_replay_buffer_samples(replay_buffer, step=state['step'])
-                _fig.savefig(path/f"replay_buffer_step_{state['step']}_interrupted.png")
-                plt.close(_fig)
-                break
+                pbar.set_postfix({
+                    "loss_reg": f"{state['loss_reg'][-1]:.2f}",
+                    "e_pos-e_rand": f"{state['e_pos'][-1] - state['e_rand'][-1]:.2f}",
+                    "e_neg-e_rand": f"{state['e_neg'][-1] - state['e_rand'][-1]:.2f}",
+                    "val_energy": f"{list(state['val_energy'].values())[-1]-list(state['val_rand_energy'].values())[-1]:.2f}" if len(state['val_energy']) > 0 else "N/A"
+                })
 
-            pbar.close()
-        tb.close()
+                pbar.update()
 
-    return (train_ebm,)
+        except KeyboardInterrupt:
+            print("Training interrupted. Saving checkpoint...")
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'ema_shadow': model_ema.shadow,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'replay_buffer': replay_buffer,
+                'state': state
+            }, path/f"step_{state['step']}_interrupted.pt")
+            _fig, _ = show_replay_buffer_samples(replay_buffer, step=state['step'])
+            _fig.savefig(path/f"replay_buffer_step_{state['step']}_interrupted.png")
+            plt.close(_fig)
+            break
+
+        pbar.close()
+    tb.close()
 
 
 @app.cell
 def _(
     alpha,
+    conditioning,
     dataloader,
     model,
     model_ema,
+    n_classes,
     noise_level,
     num_epochs,
     optimizer,
@@ -476,17 +489,16 @@ def _(
     save_every,
     scheduler,
     state,
-    train_ebm,
     val_every,
     val_loader,
 ):
     # Train the EBM
-    train_ebm(model=model, dataloader=dataloader, val_loader=val_loader, replay_buffer=replay_buffer, state=state, optimizer=optimizer, scheduler=scheduler, model_ema=model_ema, path=path, alpha=alpha, reinit_prob=reinit_prob, val_every=val_every, save_every=save_every, num_epochs=num_epochs, noise_level=noise_level)
+    train_ebm(model=model, dataloader=dataloader, val_loader=val_loader, replay_buffer=replay_buffer, state=state, optimizer=optimizer, scheduler=scheduler, model_ema=model_ema, path=path, alpha=alpha, reinit_prob=reinit_prob, val_every=val_every, save_every=save_every, num_epochs=num_epochs, noise_level=noise_level, conditioning=conditioning, n_classes=n_classes)
     return
 
 
 @app.cell
-def _(dataloader, plot_path, state):
+def _(conditioning, dataloader, plot_path, state):
     _fig, _ax = plt.subplots()
 
     # moving average for smoother curves
@@ -497,14 +509,17 @@ def _(dataloader, plot_path, state):
     _e_neg_list = np.array(state['e_neg'][:len(state['e_rand'])])  # align lengths
     _e_rand_list = np.array(state['e_rand'])  # align lengths
 
-    _ax.plot(moving_average(state['loss_reg']), label=r"$E(x^+)^2+E(x^-)^2$")
-    _ax.plot(moving_average(_e_pos_list), label=r"$E(x^+)$")
-    _ax.plot(moving_average(_e_neg_list), label=r"$E(x^-)$")
-    # _ax.plot(moving_average(_e_rand_list), label=r"$E(x^{\mathrm{rand}})$")
-    _ax.plot(moving_average(_e_pos_list-_e_rand_list), label=r"$E(x^+) - E(x^{\mathrm{rand}})$")
+    _ax.plot(moving_average(state['loss_reg']), label=r"$E(\mathbf{x}^+)^2+E(\mathbf{x}^-)^2$")
+    _ax.plot(moving_average(_e_pos_list), label=r"$E(\mathbf{x}^+)$")
+    _ax.plot(moving_average(_e_neg_list), label=r"$E(\mathbf{x}^-)$")
+    # _ax.plot(moving_average(_e_rand_list), label=r"$E(\mathbf{x}^{\mathrm{rand}})$")
+    _ax.plot(moving_average(_e_pos_list-_e_rand_list), label=r"$E(\mathbf{x}^+) - E(\mathbf{x}^{\mathrm{rand}})$")
+
+    if conditioning:
+        _ax.plot(moving_average(state['celoss']), label=r"Cross-Entropy Loss")
 
     n_val = list(state['val_energy'].keys())
-    _ax.plot(n_val, np.array(list(state['val_energy'].values()))-np.array(list(state['val_rand_energy'].values())), label=r"$E(x^{\mathrm{val}}) - E(x^{\mathrm{rand}})$")
+    _ax.plot(n_val, np.array(list(state['val_energy'].values()))-np.array(list(state['val_rand_energy'].values())), label=r"$E(\mathbf{x}^{\mathrm{val}}) - E(\mathbf{x}^{\mathrm{rand}})$")
 
     # show epochs as vertical lines
     for _e in range(1, state['step']//len(dataloader) + 1):
@@ -526,13 +541,13 @@ def _(replay_buffer):
 
 
 @app.cell
-def _(grads, model, model_ema):
-    def show_samples(model, n=16, n_steps=5000, step_size=2.0):
+def _(model, model_ema):
+    def show_samples(model, n=16, n_steps=5000, step_size=2.0, conditioning=None):
         model.eval()
         model_ema.apply_shadow()
         x = torch.rand(n, 1, 32, 32, device="cuda") * 2 - 1
         x.requires_grad_(True)
-        x = langevin_sample_train(model, x, n_steps=n_steps, step_size=step_size)
+        x = langevin_sample_train(model, x, n_steps=n_steps, step_size=step_size, conditioning=conditioning, grad_clip=1, noise_std=0.01)
 
         model_ema.restore()
         model.train()
@@ -545,14 +560,12 @@ def _(grads, model, model_ema):
 
         return fig
 
-        fig, axes = plt.subplots()
-        axes.plot(grads)
-        axes.set_title("Gradient Magnitudes During Sampling")
-        axes.set_xlabel("Sampling Step")
-        axes.set_ylabel("Mean |grad| * epsilon/2")
-        return fig
+    show_samples(model, step_size=4, n_steps=4000)
+    return
 
-    show_samples(model, step_size=1, n_steps=2000)
+
+@app.cell
+def _():
     return
 
 
