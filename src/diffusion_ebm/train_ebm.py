@@ -327,14 +327,14 @@ def eval_ebm(model, val_loader, device="cuda", num_val_batches=10):
 
 
 @app.function
-def show_replay_buffer_samples(replay_buffer, n_samples=15**2, determinisitic=True, step=None):
+def show_replay_buffer_samples(replay_buffer, n_samples=15**2, determinisitic=True, step=None, device='cuda'):
     # visualize buffer images
     with torch.no_grad():
         n_samples =min(n_samples, replay_buffer.shape[0])
         if determinisitic:
-            idxs = torch.arange(n_samples, device="cuda")
+            idxs = torch.arange(n_samples, device=device)
         else:
-            idxs = torch.randperm(replay_buffer.shape[0], device="cuda")[:n_samples]
+            idxs = torch.randperm(replay_buffer.shape[0], device=device)[:n_samples]
         samples = replay_buffer[idxs].cpu()
         samples = (samples + 1) / 2  # unnormalize from [-1, 1] to [0, 1]
         grid = torchvision.utils.make_grid(samples, nrow=np.sqrt(n_samples).astype(int))
