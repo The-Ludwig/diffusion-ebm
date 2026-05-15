@@ -10,6 +10,8 @@ import math
 import torch
 import torch.nn as nn
 
+from torch.nn.utils.parametrizations import spectral_norm
+
 
 IMG_SIZE = 32
 PATCH_SIZE = 4
@@ -174,3 +176,65 @@ class MicroET(nn.Module):
         x = self.accumulate(x)
         
         return self.output_proj(x).squeeze()
+
+
+def sn_conv(in_c, out_c, k=3, s=1, p=1):
+    return spectral_norm(nn.Conv2d(in_c, out_c, k, s, p))
+
+
+def sn_linear(in_f, out_f):
+    return spectral_norm(nn.Linear(in_f, out_f))
+
+
+class ResBlock(nn.Module):
+    def __init__(self, in_c, out_c, stride=1):
+        super().__init__()
+        self.conv1 = sn_conv(in_c, out_c, 3, stride, 1)
+        self.conv2 = sn_conv(out_c, out_c, 3, 1, 1)
+        self.act   = nn.SiLU()
+        # 1x1 conv on the skip path when shape changes
+        self.shortcut = (
+            sn_conv(in_c, out_c, 1, stride, 0)
+            if (in_c != out_c or stride != 1)
+            else nn.Identity()
+        )
+
+    def forward(self, x):
+        h = self.act(self.conv1(x))
+        h = self.conv2(h)
+        return self.act(h + self.shortcut(x))
+
+
+class EBM(nn.Module):
+    """Small CNN energy: (B, in_channels, img_size, img_size) -> (B,) scalar energy."""
+    def __init__(self, img_size=32, in_channels=1, ch=16, n_downsamples = 2, n_out = 1):
+        super().__init__()
+        self.img_size = img_size
+        self.in_channels = in_channels
+        self.n_out = n_out
+
+        layers = [sn_conv(in_channels, ch, 3, 1, 1), nn.SiLU()]
+
+        # Downsampling
+        n_c = ch
+        for i in range(n_downsamples):
+            layers.append(ResBlock(n_c, n_c*2, stride=2))
+            n_c *= 2
+
+        # Linear output
+        layers.append(nn.Flatten())
+
+        final_size = img_size // (2 ** n_downsamples)
+
+        layers.append(sn_linear(n_c * final_size * final_size, n_out))
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+    def energy(self, x):
+        if self.n_out > 1:
+            return torch.logsumexp(self.forward(x), dim=0)
+        else:
+            return self.forward(x)

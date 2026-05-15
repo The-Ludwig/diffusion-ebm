@@ -1,14 +1,3 @@
-"""
-DDPM sampling with Classifier-Free Guidance for Project 2 (Task 3).
-
-Usage:
-    python sample.py                     # one sample per class at w=3
-    python sample.py --w 7.0             # change guidance scale
-    python sample.py --num-per-class 10  # more samples per class
-
-You must fill in the two TODOs inside ``sample_images`` for Task 3.
-"""
-
 import argparse
 from pathlib import Path
 
@@ -19,7 +8,7 @@ import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity, schedule
 from tqdm.auto import tqdm
 
-from .model import MicroET, NUM_CLASSES, PAD_SIZE
+from .models import MicroET, NUM_CLASSES, PAD_SIZE
 
 
 def load_model(checkpoint_path, device):
