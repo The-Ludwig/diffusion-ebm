@@ -35,7 +35,6 @@ def _():
         print("Warning: Using CPU")
 
     root = Path(__file__).absolute().parent.parent.parent
-
     return device, root
 
 
@@ -92,7 +91,7 @@ def _(device, root):
     loaded_state = torch.load(f=ebm_path, map_location=device)
     ebm_model.load_state_dict(loaded_state['model_state_dict'])
     buffer = loaded_state['replay_buffer']
-    return buffer, dit_model
+    return (dit_model,)
 
 
 @app.cell(hide_code=True)
@@ -107,9 +106,9 @@ def _(mo):
 def _(device, dit_model):
     num_classes = 10
     num_per_class = 100
-    labels = torch.arange(num_classes, device=device).repeat_interleave(num_per_class)
-    samples = sample_images(dit_model, labels, guidance_scale=3.0, device=device)
-    return (samples,)
+    dit_labels = torch.arange(num_classes, device=device).repeat_interleave(num_per_class)
+    dit_samples = sample_images(dit_model, dit_labels, guidance_scale=3.0, device=device)
+    return (dit_samples,)
 
 
 @app.cell(hide_code=True)
@@ -121,12 +120,12 @@ def _(mo):
 
 
 @app.cell
-def _(buffer, device, samples):
-    show_replay_buffer_samples(samples, nsamples=10, device=device)
+def _(device, dit_samples):
+    show_replay_buffer_samples(dit_samples.clamp(-1, 1), n_samples=16, determinisitic=False, device=device)
 
-    gen_images = buffer[:1000]
-    gen_images.shape
-    show_replay_buffer_samples(gen_images, n_samples=10, device=device)
+    #gen_images = buffer[:1000]
+    #gen_images.shape
+    #show_replay_buffer_samples(gen_images, n_samples=10, device=device)
     return
 
 
