@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 
 from torch.nn.utils.parametrizations import spectral_norm
+from ema import EMA
 
 
 IMG_SIZE = 32
@@ -242,3 +243,18 @@ class EBM(nn.Module):
             return torch.logsumexp(self.forward(x), dim=-1)
         else:
             return self.forward(x)
+
+
+def load_energy_model(path, device="cuda"):
+    model = EBM().to(device)
+    model_ema = EMA(model, decay=0.999, burn_in=500)
+
+    ckpt = torch.load(path)
+
+    # Load everything
+    loaded_state = torch.load(path)
+    model.load_state_dict(loaded_state['model_state_dict'])
+    model_ema.shadow = loaded_state['ema_shadow']
+
+
+    return model, model_ema, loaded_state['state']
