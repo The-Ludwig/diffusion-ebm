@@ -327,7 +327,7 @@ def eval_ebm(model, val_loader, device="cuda", num_val_batches=10):
 
 
 @app.function
-def show_replay_buffer_samples(replay_buffer, n_samples=15**2, determinisitic=True, step=None, device='cuda'):
+def show_replay_buffer_samples(replay_buffer, n_samples=15**2, determinisitic=True, step=None, plt_title='Samples from Replay Buffer', device='cuda'):
     # visualize buffer images
     with torch.no_grad():
         n_samples =min(n_samples, replay_buffer.shape[0])
@@ -341,10 +341,11 @@ def show_replay_buffer_samples(replay_buffer, n_samples=15**2, determinisitic=Tr
         fig, ax = plt.subplots(figsize=(8, 8))
         ax.imshow(grid.permute(1, 2, 0))
         ax.axis("off")
-        if step is None:
-            ax.set_title("Samples from Replay Buffer")
-        else:
-            ax.set_title(f"Samples from Replay Buffer Step {step}")
+        if plt_title is not None:
+            if step is None:
+                ax.set_title(plt_title)
+            else:
+                ax.set_title(f"{plt_title} {step}")
 
     return fig, ax
 
