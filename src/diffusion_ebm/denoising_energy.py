@@ -103,7 +103,7 @@ def _():
     parser.add_argument("--num-per-class", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str, default="samples.png")
-    parser.add_argument("--energy-model", type=str, default="checkpoints/nicer_lr_schedule/step_52000.pt", help="optional energy model checkpoint for monitoring energy during sampling")
+    parser.add_argument("--energy-model", type=str, default="checkpoints/const_lr_schedule/step_180000.pt", help="optional energy model checkpoint for monitoring energy during sampling")
 
     if marimo.running_in_notebook():
         args, _ = parser.parse_known_args()
@@ -134,7 +134,6 @@ def _(device, dit_checkpoint, energy_model, root):
 
 
 @app.function
-@torch.no_grad()
 def sample_images(model, labels, guidance_scale=3.0, initial_noise=None, device=None, energy_model=None, energy_every=10):
     """Generate samples with DDPM + Classifier-Free Guidance.
 
@@ -173,9 +172,12 @@ def sample_images(model, labels, guidance_scale=3.0, initial_noise=None, device=
     if energy_model is not None:
         energies = []
         samples = []
+        cossims = []
+        l2dists = []
+        cossimf = torch.nn.CosineSimilarity(dim=1)
 
     # further speed-up tricks
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for t in tqdm(reversed(range(T)), total=T, desc="Sampling", leave=False):
 
             t_batch = torch.full((N*n_w,), t, device=device, dtype=torch.long)
@@ -184,13 +186,24 @@ def sample_images(model, labels, guidance_scale=3.0, initial_noise=None, device=
             null_labels = null_labels.flatten(0, 1)
             labels = labels.flatten(0, 1)
 
-            if energy_model is not None and t % energy_every == 0:
-                energy = energy_model(x).cpu().to(torch.float64).numpy()
-                energies.append(energy)
-                samples.append(x.cpu())
 
             eps_uncond = model(x, t_batch, null_labels).unflatten(0, (n_w, N)).clone()
             eps_cond = model(x, t_batch, labels).unflatten(0, (n_w, N))
+
+            if energy_model is not None and t % energy_every == 0:
+                with torch.enable_grad():
+                    x_dif = x.detach().clone().requires_grad_(True)
+                    energy = energy_model(x_dif)
+                    energy_grad = -torch.autograd.grad(energy.sum(), x_dif)[0]
+                score = eps_uncond / sch["sqrt_one_minus_alphas_cumprod"][t]
+
+                l2_dist = torch.norm(score.squeeze().flatten(-2) - energy_grad.squeeze().flatten(-2), dim=1).cpu().to(torch.float64).numpy()
+                cosine_sim = cossimf(score.squeeze().flatten(-2), energy_grad.squeeze().flatten(-2)).cpu().to(torch.float64).numpy()
+
+                energies.append(energy.cpu().to(torch.float64).numpy())
+                samples.append(x.cpu())
+                cossims.append(cosine_sim)
+                l2dists.append(l2_dist)
 
             x = x.unflatten(0, (n_w, N))
             null_labels = null_labels.unflatten(0, (n_w, N))
@@ -212,7 +225,7 @@ def sample_images(model, labels, guidance_scale=3.0, initial_noise=None, device=
     if energy_model is None:
         return x.squeeze(0)
 
-    return x.squeeze(0), energies, samples
+    return x.squeeze(0), energies, samples, cossims, l2dists
 
 
 @app.cell
@@ -222,53 +235,90 @@ def _(args, device, dit, ebm, energy_model):
     if energy_model is None:
         samples = sample_images(dit, labels, guidance_scale=args.w, device=device)
     else:
-        samples, energies, samples_at_step = sample_images(dit, labels, guidance_scale=args.w, device=device, energy_model=ebm) 
-    return energies, samples_at_step
+        samples, energies, samples_at_step, cossims, l2dists = sample_images(dit, labels, guidance_scale=args.w, device=device, energy_model=ebm) 
+    return cossims, energies, l2dists, samples_at_step
 
 
 @app.cell
 def _(energies, num_per_class, samples_at_step):
     from matplotlib.colors import ListedColormap
 
-    fig, ax = plt.subplots()
+    _fig, _ax = plt.subplots()
 
-    steps = np.arange(T-10, -10, -10)
+    _steps = np.arange(T-10, -10, -10)
 
     _energies = np.array(energies)
 
-    base = plt.get_cmap("viridis", lut=NUM_CLASSES)
-    cbar_cmap = ListedColormap([base(i) for i in range(NUM_CLASSES)] + [(1, 0, 0, 1)])
+    _base = plt.get_cmap("viridis", lut=NUM_CLASSES)
+    _cbar_cmap = ListedColormap([_base(i) for i in range(NUM_CLASSES)] + [(1, 0, 0, 1)])
 
-    for c in range(NUM_CLASSES):
-        ax.plot(steps, _energies[:,c], color=base(c))
+    for _c in range(NUM_CLASSES):
+        _ax.plot(_steps, _energies[:,_c], color=_base(_c))
 
-    ax.plot(steps, _energies.mean(axis=1), color="red")
+    _ax.plot(_steps, _energies.mean(axis=1), color="red")
 
 
-    cbar = plt.colorbar(
-        plt.cm.ScalarMappable(cmap=cbar_cmap, norm=plt.Normalize(vmin=0, vmax=NUM_CLASSES+1)),
-        ax=ax,
+    _cbar = plt.colorbar(
+        plt.cm.ScalarMappable(cmap=_cbar_cmap, norm=plt.Normalize(vmin=0, vmax=NUM_CLASSES+1)),
+        ax=_ax,
         ticks=np.arange(NUM_CLASSES+1) + 0.5,
     )
-    cbar.set_ticklabels([f"{i}" for i in range(NUM_CLASSES)] + ["mean"])
+    _cbar.set_ticklabels([f"{i}" for i in range(NUM_CLASSES)] + ["mean"])
 
 
 
-    for t in np.arange(0, 1050, 50):
-        idx = np.argmin(np.abs(steps - t))
-        ax.imshow(samples_at_step[idx][:10*num_per_class:num_per_class,0].flatten(0,1), cmap="gray", vmin=-1, vmax=1, extent=(t, t-50, 1, 12), aspect="auto")
+    for _t in np.arange(0, 1050, 50):
+        _idx = np.argmin(np.abs(_steps - _t))
+        _ax.imshow(samples_at_step[_idx][:10*num_per_class:num_per_class,0].flatten(0,1), cmap="gray", vmin=-1, vmax=1, extent=(_t, _t-50, 0.1*_energies.max()+_energies.min(), 0.9*_energies.max()), aspect="auto")
 
-    ax.set_ylim(0, _energies.max())
-    ax.set_xlim(T, 0)
+    _ax.set_ylim(0, _energies.max())
+    _ax.set_xlim(T, 0)
 
-    ax.set_xlabel("Denoising step $t$")
-    ax.set_ylabel("Energy / a.u.")
-    return
+    _ax.set_xlabel("Denoising step $t$")
+    _ax.set_ylabel("Energy / a.u.")
+    return (ListedColormap,)
 
 
 @app.cell
-def _():
-    list(reversed(range(T)))[-10:]
+def _(ListedColormap, cossims):
+    _fig, _ax = plt.subplots()
+
+    _steps = np.arange(T-10, -10, -10)
+
+    _cossims = np.array(cossims)
+
+    _base = plt.get_cmap("viridis", lut=NUM_CLASSES)
+    _cbar_cmap = ListedColormap([_base(i) for i in range(NUM_CLASSES)] + [(1, 0, 0, 1)])
+
+    for _c in range(NUM_CLASSES):
+        _ax.plot(_steps, _cossims[:,_c], color=_base(_c))
+    print(_cossims.shape)
+
+    _ax.plot(_steps, _cossims.mean(axis=1), color="red")
+
+
+    _cbar = plt.colorbar(
+        plt.cm.ScalarMappable(cmap=_cbar_cmap, norm=plt.Normalize(vmin=0, vmax=NUM_CLASSES+1)),
+        ax=_ax,
+        ticks=np.arange(NUM_CLASSES+1) + 0.5,
+    )
+    _cbar.set_ticklabels([f"{i}" for i in range(NUM_CLASSES)] + ["mean"])
+
+
+
+    # for _t in np.arange(0, 1050, 50):
+    #     _idx = np.argmin(np.abs(_steps - _t))
+    #     _ax.imshow(samples_at_step[_idx][:10*num_per_class:num_per_class,0].flatten(0,1), cmap="gray", vmin=-1, vmax=1, extent=(_t, _t-50, -0.15, 0.3), aspect="auto")
+
+    _ax.set_ylim(-0.25, 0.4)
+    _ax.set_xlim(T, 0)
+
+    _ax.text(500, 0.35, r"$\uparrow$ Similar $\uparrow$", ha="center")
+    _ax.text(500, -0.22, "$\downarrow$ Dissimilar $\downarrow$", ha="center")
+
+    _ax.set_xlabel("Denoising step $t$")
+    _ax.set_ylabel(r"Cosine Similarity $\nabla_\mathbf{x} E_{\phi}/s_{\theta}(\mathbf{x})$")
+    _fig
     return
 
 
@@ -276,6 +326,46 @@ def _():
 def _(dit, ebm):
     print(f"Trainable parameters in EBM: {sum(p.numel() for p in ebm.parameters() if p.requires_grad)}")
     print(f"Trainable parameters in DiT: {sum(p.numel() for p in dit.parameters() if p.requires_grad)}")
+    return
+
+
+@app.cell
+def _(ListedColormap, l2dists, num_per_class, samples_at_step):
+    _fig, _ax = plt.subplots()
+
+    _steps = np.arange(T-10, -10, -10)
+
+    _l2dists = np.array(l2dists)
+
+    _base = plt.get_cmap("viridis", lut=NUM_CLASSES)
+    _cbar_cmap = ListedColormap([_base(i) for i in range(NUM_CLASSES)] + [(1, 0, 0, 1)])
+
+    for _c in range(NUM_CLASSES):
+        _ax.plot(_steps, _l2dists[:,_c], color=_base(_c))
+    print(_l2dists.shape)
+
+    _ax.plot(_steps, _l2dists.mean(axis=1), color="red")
+
+
+    _cbar = plt.colorbar(
+        plt.cm.ScalarMappable(cmap=_cbar_cmap, norm=plt.Normalize(vmin=0, vmax=NUM_CLASSES+1)),
+        ax=_ax,
+        ticks=np.arange(NUM_CLASSES+1) + 0.5,
+    )
+    _cbar.set_ticklabels([f"{i}" for i in range(NUM_CLASSES)] + ["mean"])
+
+
+
+    for _t in np.arange(0, 1050, 50):
+        _idx = np.argmin(np.abs(_steps - _t))
+        _ax.imshow(samples_at_step[_idx][:10*num_per_class:num_per_class,0].flatten(0,1), cmap="gray", vmin=-1, vmax=1, extent=(_t, _t-50, 1, 12), aspect="auto")
+
+    _ax.set_ylim(20, 10000)
+    _ax.set_yscale("log")
+    _ax.set_xlim(T, 0)
+
+    _ax.set_xlabel("Denoising step $t$")
+    _ax.set_ylabel(r"L2 Distance $E_{\phi}/s_{\theta}$")
     return
 
 

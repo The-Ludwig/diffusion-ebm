@@ -255,6 +255,7 @@ def load_energy_model(path, device="cuda"):
     loaded_state = torch.load(path)
     model.load_state_dict(loaded_state['model_state_dict'])
     model_ema.shadow = loaded_state['ema_shadow']
+    model_ema.to(device)
 
 
-    return model, model_ema, loaded_state['state']
+    return model, model_ema, loaded_state

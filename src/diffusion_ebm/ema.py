@@ -13,6 +13,16 @@ class EMA:
             if param.requires_grad:
                 self.shadow[name] = param.data.clone()
 
+
+    def to(self, device):
+        for name in self.shadow:
+            self.shadow[name] = self.shadow[name].to(device)
+
+        for name in self.backup:
+            self.backup[name] = self.backup[name].to(device)
+
+        return self
+
     def update(self):
         self.step += 1
 
