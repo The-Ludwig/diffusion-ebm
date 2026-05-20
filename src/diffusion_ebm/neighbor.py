@@ -87,7 +87,7 @@ def _(device, root):
     dit_model = load_model(dit_path, device=device)
 
 
-    ebm_path = root/"checkpoints/nicer_lr_schedule/step_30000.pt"
+    ebm_path = root/"checkpoints/const_lr_schedule/step_180000.pt"
     ebm_model = EBM()
 
     loaded_state = torch.load(f=ebm_path, map_location=device)
@@ -237,6 +237,12 @@ def summarize_distances(name, dists):
 
 @app.cell
 def _(buffer, dit_samples, train_imgs, val_imgs):
+    # latex font
+    plt.rcParams['font.family'] = 'STIXGeneral'
+    plt.rcParams['font.size'] = 16
+    plt.rcParams['mathtext.fontset'] = 'cm'
+
+    # dists
     dit_dists = compute_nn_distances(dit_samples, train_imgs)
     ebm_dists = compute_nn_distances(buffer[:1000], train_imgs)
     real_dists = compute_nn_distances(val_imgs[:1000], train_imgs)
@@ -246,15 +252,15 @@ def _(buffer, dit_samples, train_imgs, val_imgs):
     bins = torch.linspace(all_dists.min(), all_dists.max(), 81).numpy()
 
     series = [
-        ("DiT", dit_dists, "C0"),
-        ("EBM buffer", ebm_dists, "C1"),
-        ("real (val)", real_dists, "C2"),
+        ("DiT", dit_dists, "#F1C40F"),
+        ("EBM buffer", ebm_dists, "#3498DB"),
+        ("real (val)", real_dists, "#16A085"),
     ]
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharex=True, sharey=True)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharex=True, sharey=True, dpi=300)
     for ax, (name, d, color) in zip(axes, series):
         ax.hist(d.numpy(), bins=bins, color=color, alpha=0.8)
         ax.set_title(name)
-        ax.set_xlabel("L2 distance to nearest train neighbor")
+        ax.set_xlabel("$L_2$ distance to nearest train neighbor")
     axes[0].set_ylabel("count")
     plt.tight_layout()
 
