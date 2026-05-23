@@ -189,13 +189,15 @@ def sample_images(model, labels, guidance_scale=3.0, initial_noise=None, device=
 
             eps_uncond = model(x, t_batch, null_labels).unflatten(0, (n_w, N)).clone()
             eps_cond = model(x, t_batch, labels).unflatten(0, (n_w, N))
+            eps = eps_uncond + guidance_scale[:, None, None, None, None] * (eps_cond - eps_uncond)
 
             if energy_model is not None and t % energy_every == 0:
                 with torch.enable_grad():
                     x_dif = x.detach().clone().requires_grad_(True)
+                    x_dif = x_dif.clamp(-1, 1)
                     energy = energy_model(x_dif)
                     energy_grad = -torch.autograd.grad(energy.sum(), x_dif)[0]
-                score = eps_uncond / sch["sqrt_one_minus_alphas_cumprod"][t]
+                score = eps / sch["sqrt_one_minus_alphas_cumprod"][t]
 
                 l2_dist = torch.norm(score.squeeze().flatten(-2) - energy_grad.squeeze().flatten(-2), dim=1).cpu().to(torch.float64).numpy()
                 cosine_sim = cossimf(score.squeeze().flatten(-2), energy_grad.squeeze().flatten(-2)).cpu().to(torch.float64).numpy()
@@ -209,7 +211,6 @@ def sample_images(model, labels, guidance_scale=3.0, initial_noise=None, device=
             null_labels = null_labels.unflatten(0, (n_w, N))
             labels = labels.unflatten(0, (n_w, N))
 
-            eps = eps_uncond + guidance_scale[:, None, None, None, None] * (eps_cond - eps_uncond)
 
             sqrt_recip_alpha = sch["sqrt_recip_alphas"][t]
             beta_fac = sch["betas"][t]/sch["sqrt_one_minus_alphas_cumprod"][t]
@@ -240,7 +241,12 @@ def _(args, device, dit, ebm, energy_model):
 
 
 @app.cell
-def _(energies, num_per_class, samples_at_step):
+def _():
+    return
+
+
+@app.cell
+def _(energies, num_per_class, root, samples_at_step):
     from matplotlib.colors import ListedColormap
 
     _fig, _ax = plt.subplots()
@@ -276,11 +282,15 @@ def _(energies, num_per_class, samples_at_step):
 
     _ax.set_xlabel("Denoising step $t$")
     _ax.set_ylabel("Energy / a.u.")
+
+    _fig.savefig(root/"plots/denoising_energy.png")
+
+    _fig 
     return (ListedColormap,)
 
 
 @app.cell
-def _(ListedColormap, cossims):
+def _(ListedColormap, cossims, root):
     _fig, _ax = plt.subplots()
 
     _steps = np.arange(T-10, -10, -10)
@@ -317,7 +327,10 @@ def _(ListedColormap, cossims):
     _ax.text(500, -0.22, "$\downarrow$ Dissimilar $\downarrow$", ha="center")
 
     _ax.set_xlabel("Denoising step $t$")
-    _ax.set_ylabel(r"Cosine Similarity $\nabla_\mathbf{x} E_{\phi}/s_{\theta}(\mathbf{x})$")
+    _ax.set_ylabel(r"Cosine Similarity $\nabla_\mathbf{x} E_{\phi}(\mathbf{x})\cdot s_{\theta}(\mathbf{x})$")
+
+    _fig.savefig(root/"plots/denoising_energy_cossim.png")
+
     _fig
     return
 
@@ -366,6 +379,13 @@ def _(ListedColormap, l2dists, num_per_class, samples_at_step):
 
     _ax.set_xlabel("Denoising step $t$")
     _ax.set_ylabel(r"L2 Distance $E_{\phi}/s_{\theta}$")
+    return
+
+
+@app.cell
+def _(dit, ebm):
+    print("Trainable parameters in EBM: ", sum(p.numel() for p in ebm.parameters() if p.requires_grad))
+    print("Trainable parameters in DiT: ", sum(p.numel() for p in dit.parameters() if p.requires_grad))
     return
 
 

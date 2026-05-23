@@ -243,6 +243,13 @@ def _(
 
 
 @app.cell
+def _(dataloader):
+    epoch_size = len(dataloader)
+    print(f"Epoch size (number of batches): {epoch_size}")
+    return
+
+
+@app.cell
 def _(conditioning, device, model, n_classes, replay_size):
     ##########################################
     # Set up replay buffer and training state
@@ -300,7 +307,6 @@ def _(
             state[key] = loaded_state['state'][key]
     else: 
         path.mkdir(parents=True, exist_ok=True)
-
     return path, plot_path
 
 
@@ -337,7 +343,7 @@ def show_replay_buffer_samples(replay_buffer, n_samples=15**2, determinisitic=Tr
         samples = replay_buffer[idxs].cpu()
         samples = (samples + 1) / 2  # unnormalize from [-1, 1] to [0, 1]
         grid = torchvision.utils.make_grid(samples, nrow=np.sqrt(n_samples).astype(int))
-        fig, ax = plt.subplots(figsize=(8, 8))
+        fig, ax = plt.subplots(figsize=(4, 4))
         ax.imshow(grid.permute(1, 2, 0))
         ax.axis("off")
         if plt_title is not None:
@@ -523,9 +529,11 @@ def _(conditioning, dataloader, plot_path, state):
 
     # show epochs as vertical lines
     for _e in range(1, state['step']//len(dataloader) + 1):
-        _ax.axvline(x=_e*len(dataloader), color="gray", linestyle="--", alpha=0.2)
+        if _e % 10 == 0:
+            _ax.axvline(x=_e*len(dataloader), color="gray", linestyle="--", alpha=0.2)
 
     _ax.legend()
+    _ax.grid(False)
 
     _ax.set_xlabel("Training Step")
     _ax.set_ylabel("Value")

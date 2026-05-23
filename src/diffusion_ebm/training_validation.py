@@ -122,7 +122,7 @@ def inception_score(sample, classifier, splits=1):
 
         # this finds the mean in each class
         p_marginal = part.mean(dim=0) 
-        
+
         # this sums over the different classes
         kl_div = (part*(part.log()-p_marginal.log())).sum(dim=1)
 
@@ -142,13 +142,13 @@ def get_gaussian_params(data):
 def sqrtm(cov):
     # Eigen decomposition
     eigvals, eigvecs = torch.linalg.eigh(cov)
-    
+
     # Handle small eigenvalues for numerical stability
     eigvals_clipped = torch.clamp(eigvals, min=1e-10)
-    
+
     # Square root of eigenvalues
     sqrt_eigvals = torch.sqrt(eigvals_clipped)
-    
+
     # Reconstruct the square root matrix
     sqrt_cov = eigvecs @ torch.diag(sqrt_eigvals) @ eigvecs.T
     return sqrt_cov
@@ -235,7 +235,6 @@ def _(classifier, folder, improved_pr_pixel, real_sample, root):
         pbar = tqdm(checkpoints)
         for cp in pbar:
             step = get_step(cp)
-            loaded = torch.load(cp)
 
             model, model_ema, state = load_energy_model(cp, device="cuda")
             model_ema.apply_shadow()
@@ -261,7 +260,6 @@ def _(classifier, folder, improved_pr_pixel, real_sample, root):
             r_list.append(r)
 
             pbar.set_postfix({"Inception Score": f"{is_[0]:.2f}±{is_[1]:.2f}", "FID": f"{fid_:.2f}", "Precision": f"{p:.2f}", "Recall": f"{r:.2f}"})
-
     return checkpoints, fid_list, get_step, is_list, p_list, r_list
 
 
@@ -339,7 +337,7 @@ def _(
 
         # Double check
         score = InceptionScore(feature=classifier, normalize=False, compute_with_cache=False)
-    
+
         print(f"Inception score (torchmetrics): {score(sample)}")
 
         # FID 
