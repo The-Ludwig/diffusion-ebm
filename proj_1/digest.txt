@@ -1,0 +1,714 @@
+Directory structure:
+└── code/
+    ├── README.md
+    ├── ddpm_mnist_final.pth
+    ├── pyproject.toml
+    └── src/
+        └── assignment1/
+            ├── data.py
+            ├── ema.py
+            ├── helpers.py
+            ├── model.py
+            ├── sample.py
+            ├── train.py
+            └── classifier/
+                ├── helper.py
+                ├── model.py
+                └── train.py
+
+================================================
+FILE: README.md
+================================================
+# README.md 
+
+This repository contains my attempt at learning generative AI specifically for
+generative AI.
+
+The code is organized in the follwing way:
+- src/
+    - ddpm/
+        - Contains code related to Denoising Diffusion Probabilistic Models (DDPM).
+
+
+
+================================================
+FILE: ddpm_mnist_final.pth
+================================================
+[Binary file]
+
+
+================================================
+FILE: pyproject.toml
+================================================
+[project]
+name = "diffusion-models"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "gitingest>=0.3.1",
+    "setuptools<=79.0.0",
+    "tensorboard>=2.20.0",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+    "tqdm>=4.67.3",
+]
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+
+================================================
+FILE: src/assignment1/data.py
+================================================
+import torch
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+
+
+def get_dataloader(batch_size=128):
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,)),  # Scale to [-1, 1]
+        ]
+    )
+
+    dataset = datasets.MNIST(
+        root="./data", train=True, download=True, transform=transform
+    )
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+
+
+
+================================================
+FILE: src/assignment1/ema.py
+================================================
+class EMA:
+    def __init__(self, model, decay=0.9999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+
+        # Initialize shadow weights
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = (
+                    1.0 - self.decay
+                ) * param.data + self.decay * self.shadow[name]
+                self.shadow[name] = new_average.clone()
+
+    def apply_shadow(self):
+        """Apply EMA weights to model (for sampling)"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+
+    def restore(self):
+        """Restore original weights (after sampling)"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data = self.backup[name]
+        self.backup = {}
+
+
+
+================================================
+FILE: src/assignment1/helpers.py
+================================================
+import torch
+from model import UNet
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def load_model_for_inference(checkpoint_path):
+    model = UNet().to(device)
+    checkpoint = torch.load(checkpoint_path)
+
+    # Load EMA weights directly into model
+    model.load_state_dict(checkpoint["ema"])
+
+    return model
+
+
+
+================================================
+FILE: src/assignment1/model.py
+================================================
+import torch
+import torch.nn as nn
+import math
+
+class TimeEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim)
+        )
+    
+    def forward(self, t):
+        device = t.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = t[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return self.mlp(embeddings)
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, time_emb_dim, dropout=0.1):
+        super().__init__()
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, out_ch)
+        )
+        
+        self.conv1 = nn.Sequential(
+            nn.GroupNorm(8, in_ch),
+            nn.SiLU(),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.GroupNorm(8, out_ch),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        )
+        
+        # Residual connection
+        if in_ch != out_ch:
+            self.residual_conv = nn.Conv2d(in_ch, out_ch, 1)
+        else:
+            self.residual_conv = nn.Identity()
+    
+    def forward(self, x, t):
+        h = self.conv1(x)
+        
+        # Add time conditioning
+        time_emb = self.time_mlp(t)[:, :, None, None]
+        h = h + time_emb
+        
+        h = self.conv2(h)
+        
+        # Residual connection
+        return h + self.residual_conv(x)
+
+
+class AttentionBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.norm = nn.GroupNorm(8, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
+    
+    def forward(self, x):
+        B, C, H, W = x.shape
+        
+        h = self.norm(x)
+        qkv = self.qkv(h)
+        q, k, v = qkv.chunk(3, dim=1)
+        
+        # Reshape for attention
+        q = q.reshape(B, C, H * W).permute(0, 2, 1)  # B, HW, C
+        k = k.reshape(B, C, H * W)  # B, C, HW
+        v = v.reshape(B, C, H * W).permute(0, 2, 1)  # B, HW, C
+        
+        # Attention
+        scale = C ** -0.5
+        attn = torch.softmax(torch.bmm(q, k) * scale, dim=-1)
+        h = torch.bmm(attn, v)
+        
+        # Reshape back
+        h = h.permute(0, 2, 1).reshape(B, C, H, W)
+        h = self.proj(h)
+        
+        return x + h
+
+
+class DownBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, time_emb_dim, use_attention=False):
+        super().__init__()
+        self.res1 = ResidualBlock(in_ch, out_ch, time_emb_dim)
+        self.res2 = ResidualBlock(out_ch, out_ch, time_emb_dim)
+        self.attention = AttentionBlock(out_ch) if use_attention else nn.Identity()
+        self.downsample = nn.Conv2d(out_ch, out_ch, 3, stride=2, padding=1)
+    
+    def forward(self, x, t):
+        x = self.res1(x, t)
+        x = self.res2(x, t)
+        x = self.attention(x)
+        skip = x
+        x = self.downsample(x)
+        return x, skip
+
+
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, time_emb_dim, use_attention=False):
+        super().__init__()
+        self.upsample = nn.ConvTranspose2d(in_ch, in_ch, 4, stride=2, padding=1)
+        self.res1 = ResidualBlock(in_ch * 2, out_ch, time_emb_dim)  # *2 for skip connection
+        self.res2 = ResidualBlock(out_ch, out_ch, time_emb_dim)
+        self.attention = AttentionBlock(out_ch) if use_attention else nn.Identity()
+    
+    def forward(self, x, skip, t):
+        x = self.upsample(x)
+        x = torch.cat([x, skip], dim=1)
+        x = self.res1(x, t)
+        x = self.res2(x, t)
+        x = self.attention(x)
+        return x
+
+
+class UNet(nn.Module):
+    def __init__(self, in_channels=1, model_channels=32, time_emb_dim=64):
+        super().__init__()
+        
+        self.time_mlp = TimeEmbedding(time_emb_dim)
+        
+        # Initial projection
+        self.init_conv = nn.Conv2d(in_channels, model_channels, 3, padding=1)
+        
+        # Simpler encoder - only 1 ResBlock per level
+        self.down1 = nn.ModuleList([
+            ResidualBlock(model_channels, model_channels, time_emb_dim),
+            nn.Conv2d(model_channels, model_channels, 3, stride=2, padding=1)
+        ])
+        
+        self.down2 = nn.ModuleList([
+            ResidualBlock(model_channels, model_channels * 2, time_emb_dim),
+            nn.Conv2d(model_channels * 2, model_channels * 2, 3, stride=2, padding=1)
+        ])
+        
+        # Bottleneck with attention (smaller resolution, so attention is cheap)
+        self.bottleneck = nn.ModuleList([
+            ResidualBlock(model_channels * 2, model_channels * 2, time_emb_dim),
+            AttentionBlock(model_channels * 2),
+            ResidualBlock(model_channels * 2, model_channels * 2, time_emb_dim)
+        ])
+        
+        # Decoder
+        self.up1 = nn.ModuleList([
+            nn.ConvTranspose2d(model_channels * 2, model_channels * 2, 4, stride=2, padding=1),
+            ResidualBlock(model_channels * 4, model_channels, time_emb_dim)  # *4 for concat
+        ])
+        
+        self.up2 = nn.ModuleList([
+            nn.ConvTranspose2d(model_channels, model_channels, 4, stride=2, padding=1),
+            ResidualBlock(model_channels * 2, model_channels, time_emb_dim)
+        ])
+        
+        # Final projection
+        self.final = nn.Sequential(
+            nn.GroupNorm(8, model_channels),
+            nn.SiLU(),
+            nn.Conv2d(model_channels, in_channels, 3, padding=1)
+        )
+    
+    def forward(self, x, t):
+        t_emb = self.time_mlp(t)
+        
+        x = self.init_conv(x)
+        
+        # Down 1
+        skip1 = self.down1[0](x, t_emb)
+        x = self.down1[1](skip1)
+        
+        # Down 2
+        skip2 = self.down2[0](x, t_emb)
+        x = self.down2[1](skip2)
+        
+        # Bottleneck
+        for layer in self.bottleneck:
+            if isinstance(layer, ResidualBlock):
+                x = layer(x, t_emb)
+            else:
+                x = layer(x)
+        
+        # Up 1
+        x = self.up1[0](x)
+        x = torch.cat([x, skip2], dim=1)
+        x = self.up1[1](x, t_emb)
+        
+        # Up 2
+        x = self.up2[0](x)
+        x = torch.cat([x, skip1], dim=1)
+        x = self.up2[1](x, t_emb)
+        
+        return self.final(x)
+
+
+
+================================================
+FILE: src/assignment1/sample.py
+================================================
+import torch
+from tqdm import tqdm
+
+
+@torch.no_grad()
+def sample(
+    model, n_samples, image_channels, image_size, T, alpha, alpha_cumprod, beta, device
+):
+    model.eval()
+    # Start from pure noise
+    x = torch.randn((n_samples, image_channels, image_size, image_size), device=device)
+
+    for i in tqdm(reversed(range(T)), total=T, desc="Sampling", leave=False):
+        t = torch.full((n_samples,), i, device=device, dtype=torch.long)
+
+        # Predict noise
+        predicted_noise = model(x, t)
+
+        # Get coefficients for the current timestep
+        alpha_t = alpha[i]
+        alpha_cumprod_t = alpha_cumprod[i]
+        beta_t = beta[i]
+
+        if i > 0:
+            noise = torch.randn_like(x)
+        else:
+            noise = 0
+
+        # DDPM Reverse Step formula
+        # x_{t-1} = 1/sqrt(alpha_t) * (x_t - (1-alpha_t)/sqrt(1-alpha_cumprod_t) * eps_theta) + sigma_t * noise
+        mean = (1 / torch.sqrt(alpha_t)) * (
+            x - ((1 - alpha_t) / torch.sqrt(1 - alpha_cumprod_t)) * predicted_noise
+        )
+        std = torch.sqrt(beta_t)
+
+        x = mean + std * noise
+
+    model.train()
+    # Rescale from [-1, 1] back to [0, 1] for visualization
+    x = (x.clamp(-1, 1) + 1) / 2
+    return x
+
+
+
+================================================
+FILE: src/assignment1/train.py
+================================================
+import os
+import torch
+import torch.nn.functional as F
+import torchvision
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm  # Import tqdm
+from data import get_dataloader
+from model import UNet
+from ema import EMA
+from sample import sample
+
+# Hyperparameters
+T = 300
+device = "cuda" if torch.cuda.is_available() else "cpu"
+lr = 1e-3
+epochs = 50
+batch_size = 128
+
+# DDPM Schedule
+beta = torch.linspace(1e-4, 0.02, T).to(device)
+alpha = 1.0 - beta
+alpha_cumprod = torch.cumprod(alpha, dim=0)
+
+
+def forward_diffusion(x_0, t):
+    noise = torch.randn_like(x_0)
+    sqrt_alpha_cumprod = torch.sqrt(alpha_cumprod[t]).view(-1, 1, 1, 1)
+    sqrt_one_minus_alpha_cumprod = torch.sqrt(1.0 - alpha_cumprod[t]).view(-1, 1, 1, 1)
+    return sqrt_alpha_cumprod * x_0 + sqrt_one_minus_alpha_cumprod * noise, noise
+
+
+def train():
+    dataloader = get_dataloader(batch_size=batch_size)
+    model = UNet().to(device)  # or ImprovedUNet
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    # Initialize EMA
+    ema = EMA(model, decay=0.9999)
+
+    train_writer = SummaryWriter("runs/ddpm_mnist/train")
+    val_writer = SummaryWriter("runs/ddpm_mnist/val")
+    os.makedirs("checkpoints", exist_ok=True)
+
+    print(f"Training on {device}...")
+
+    pbar = tqdm(range(epochs), desc="Epochs")
+    for epoch in pbar:
+        model.train()
+        train_loss = 0
+
+        batch_pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
+        for images, _ in batch_pbar:
+            images = images.to(device)
+            t = torch.randint(0, T, (images.shape[0],), device=device).long()
+            x_noisy, noise = forward_diffusion(images, t)
+
+            predicted_noise = model(x_noisy, t)
+            loss = F.mse_loss(predicted_noise, noise)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Update EMA after each step
+            ema.update()
+
+            train_loss += loss.item()
+            batch_pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        avg_train_loss = train_loss / len(dataloader)
+        train_writer.add_scalar("Loss/epoch", avg_train_loss, epoch)
+
+        # Validation (using regular model, not EMA)
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for i, (images, _) in enumerate(dataloader):
+                if i > 5:
+                    break
+                images = images.to(device)
+                t = torch.randint(0, T, (images.shape[0],), device=device).long()
+                x_noisy, noise = forward_diffusion(images, t)
+                pred = model(x_noisy, t)
+                val_loss += F.mse_loss(pred, noise).item()
+
+        avg_val_loss = val_loss / 6
+        val_writer.add_scalar("Loss/epoch", avg_val_loss, epoch)
+
+        pbar.set_postfix(
+            train_loss=f"{avg_train_loss:.4f}", val_loss=f"{avg_val_loss:.4f}"
+        )
+
+        # Checkpointing and Sampling with EMA weights
+        if epoch % 5 == 0 or epoch == epochs - 1:
+            # Save both regular and EMA checkpoints
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "ema": ema.shadow,
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch,
+                },
+                f"checkpoints/ddpm_epoch_{epoch}.pth",
+            )
+
+            tqdm.write(f"Generating samples at epoch {epoch} (using EMA)...")
+
+            # Use EMA weights for sampling
+            ema.apply_shadow()
+            images = sample(model, 16, 1, 28, T, alpha, alpha_cumprod, beta, device)
+            ema.restore()
+
+            grid = torchvision.utils.make_grid(images, nrow=4)
+            train_writer.add_image("Generated_Digits", grid, epoch)
+
+    train_writer.close()
+    val_writer.close()
+
+    # Save final model with EMA
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "ema": ema.shadow,
+        },
+        "ddpm_mnist_final.pth",
+    )
+
+
+if __name__ == "__main__":
+    train()
+
+
+
+================================================
+FILE: src/assignment1/classifier/helper.py
+================================================
+import torch
+from classifier_model import ResNetMini
+
+def load_classifier(model_path="checkpoints/classifier_mnist_resnet.pth", device=None):
+    """
+    Initializes the ResNetMini architecture and loads saved weights.
+    
+    Args:
+        model_path (str): Path to the .pth file.
+        device (str): 'cuda' or 'cpu'. Auto-detects if None.
+        
+    Returns:
+        torch.nn.Module: The loaded model in eval mode.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
+
+    # 1. Initialize the architecture
+    model = ResNetMini()
+
+    # 2. Load the state dictionary
+    try:
+        state_dict = torch.load(model_path, map_map_location=device)
+        model.load_state_dict(state_dict)
+        print(f"Successfully loaded model from {model_path}")
+    except FileNotFoundError:
+        print(f"Error: {model_path} not found. Did you run train_classifier.py first?")
+        return None
+
+    # 3. Move to device and set to evaluation mode
+    model.to(device)
+    model.eval()
+    
+    return model
+
+if __name__ == "__main__":
+    # Quick test to verify loading works
+    my_model = load_classifier()
+    if my_model:
+        print("Model is ready for inference!")
+
+
+
+================================================
+FILE: src/assignment1/classifier/model.py
+================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion * planes,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion * planes)
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+class FinalResNet(nn.Module):
+    def __init__(self, block, num_blocks, num_classes=10):
+        super(FinalResNet, self).__init__()
+        self.in_planes = 32
+
+        # MNIST is grayscale, so in_channels=1
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+
+        self.layer1 = self._make_layer(block, 32, num_blocks[0], stride=2)
+        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 10, num_blocks[2], stride=2)
+
+        self.linear = nn.Linear(10, num_classes)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = F.avg_pool2d(out, out.size()[2:]) # Dynamic pooling for any size
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+
+def ResNetMini():
+    return FinalResNet(BasicBlock, [2, 2, 2])
+
+
+
+================================================
+FILE: src/assignment1/classifier/train.py
+================================================
+import torch
+import torch.optim as optim
+import torch.nn as nn
+from data import get_dataloader
+from .model import ResNetMini
+
+
+def train():
+    # Hyperparameters
+    epochs = 15
+    lr = 0.001
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Initialize
+    model = ResNetMini().to(device)
+    train_loader = get_dataloader(batch_size=128)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    print(f"Starting training on {device}...")
+
+    model.train()
+    for epoch in range(epochs):
+        running_loss = 0.0
+        for i, (images, labels) in enumerate(train_loader):
+            images, labels = images.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            if (i + 1) % 100 == 0:
+                print(
+                    f"Epoch [{epoch + 1}/{epochs}], Step [{i + 1}/{
+                        len(train_loader)
+                    }], Loss: {running_loss / 100:.4f}"
+                )
+                running_loss = 0.0
+
+    save_path = "checkpoints/classifier_mnist_resnet.pth"
+    torch.save(model.state_dict(), save_path)
+    print(f"Model saved successfully to {save_path}")
+
+
+if __name__ == "__main__":
+    train()
+
+
